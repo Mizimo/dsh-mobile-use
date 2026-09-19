@@ -1,0 +1,10 @@
+# 建置產物
+*.class
+*.apk
+*.zip
+build/
+out/
+# 本機執行期狀態
+*.log
+*.tmp
+poc/out/

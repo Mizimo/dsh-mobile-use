@@ -1,5 +1,7 @@
 # dsh-mobile-use
 
+**English** | [中文說明](README.zh.md)
+
 Pure-ADB Android device control for DeepSeek Harness — a re-implementation of the
 [`agent-mobile-use`](https://github.com/AcidGr/agent-mobile-use) virtual-display
 architecture **without root, without an unlocked bootloader, without KernelSU and

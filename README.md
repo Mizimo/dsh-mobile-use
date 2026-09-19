@@ -21,9 +21,15 @@ Test device: **Sony SO-51D (Xperia 5 V, docomo) / Android 15 (SDK 35)**,
 | Create a headless virtual display | ✅ | `DisplayDeviceInfo{"AgentVirtualDisplay" … type VIRTUAL, owner com.android.shell (uid 2000)}` |
 | Launch an app **onto** that display | ✅ | `am start --display 10 -n …Calculator` → `topResumedActivity` on `Display #10` |
 | Inject touch into that display | ✅ | `input -d 10 tap …` exit 0 |
-| Main display stays untouched | ✅ | `Display #0` keeps its own activity stack |
-| Capture the virtual display's frames | ❌ | `screencap -d` → `Status: -2`; our ImageReader receives no frames |
+| Capture the display's frames | ✅ | ImageReader → PNG, 155 KB, 1096×2560 (see below) |
+| Closed loop: perceive → act → verify | ✅ | tap `7` on the display, re-capture, the display shows `7` |
+| Main display stays untouched | ✅ | `Display #0` keeps `com.sonymobile.launcher` while `Display #15` runs the calculator |
 | Clear the soft keyboard on the display | ⚠️ | `setDisplayImePolicy` call rejected (non-fatal) |
+
+The captured frame is the virtual display's own content, not a mirror of the
+phone: the pixel evidence is a Google Calculator at 1096×2560 with the phone's
+home screen still on display 0.
+
 
 Everything in that table is reproducible with the scripts in `poc/` — see below.
 

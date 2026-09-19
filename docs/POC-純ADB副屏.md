@@ -207,3 +207,62 @@ Android 早期版本只在失敗後才驗這兩個欄位。**Android 15 是否�
 `poc/direct_adb.py` 走的是同一條已配對的 ADB 連線（同一把 adbkey），但不經過 DSH 包裝層的 `/device/plan` 准許清單——那張清單連 `app_process`、`am`、`input`、`screencap` 都不准，而這些正是本 PoC 的全部內容。
 
 因此本 PoC 自我約束：只做唯讀探測與副屏實驗，**不碰簡訊、不碰 DCIM/Pictures/Android/data/obb、不改系統設定、不 mount、不卸載應用、不用 su**。測試產物在結束時已從設備清除（僅留 `/data/local/tmp/agent_vd2.dex` 供下一輪使用）。
+
+---
+
+# 7. 第二輪：畫面擷取與閉環（2026-09-20 續）
+
+## 7.1 第 6.3 節的三項，兩項已解
+
+| 項目 | 第 6 節狀態 | 現在 | 原因 |
+|---|---|---|---|
+| 副屏 frame 擷取 | ❌「收不到 frame」 | ✅ 成功 | **不是合成問題，是我自己的反射 bug**（見 7.2） |
+| 感知 → 行動 → 驗證閉環 | 未測 | ✅ 成功 | tap `7` → 再截圖 → 畫面出現 `7` |
+| `setDisplayImePolicy` | ⚠️ 被拒 | ⚠️ 仍被拒 | 未解，非致命 |
+
+第 6.3 節寫「自家 ImageReader 收不到 frame」是**誤判**。加了 frame 計數器之後，狀態檔顯示：
+
+```json
+{"frames":90,"acquire_attempts":1165,"acquire_errors":0,"last_capture":"ok 1096x2560"}
+```
+
+frame 一直在進來（90 張），`acquire_errors` 為 0。**畫面管線從頭到尾都是通的**，是我把結果丟掉了。
+
+## 7.2 真正的三個 bug（都在我這邊）
+
+1. **`Image.Plane[]` 的 length 是欄位不是方法。**
+   我寫 `invoke(planes, "length")`，而 `invoke()` 只找方法 → `NoSuchMethodException`，
+   整個 `saveFrame` 進 catch，於是我看到「沒有截圖」就誤判成「沒有 frame」。
+   正解：`java.lang.reflect.Array.getLength(planes)`。
+
+2. **`accepts()` 用 `isInstance` 判斷原始型別。**
+   `int.class.isInstance(Integer.valueOf(1))` **永遠是 false**。
+   結果所有帶 `int` 參數的重載全被判為不合格，`invoke`/`invokeStatic` 退回「同 arity 的第一個」，
+   於是 `Bitmap.createBitmap(Bitmap,int,int,int,int)` 被解析到別的 5 參數重載，
+   丟出 `IllegalArgumentException: argument 1 has type int, got android.graphics.Bitmap`。
+   正解：原始型別先映射到 wrapper class 再比對（`boxed()`）。
+
+3. **`invokeStatic` 根本沒做型別篩選。**
+   只比 arity。`Bitmap.createBitmap` 光 5 參數就有多個重載，必然挑錯。
+   正解：讓 `invokeStatic` 與 `invoke` 共用同一套 `accepts()` 選擇邏輯。
+
+三個 bug 的共同點：**都是我為了「不引入任何 android.* 匯入」而全手寫反射時自己種下的**，
+而它們的症狀全部長得像「設備/框架不支援」。這也是為什麼第 6 節會做出錯誤結論——
+**把「我的程式碼接錯」誤讀成「平台不給」。**
+
+## 7.3 閉環的硬證據
+
+1. 副屏 display 15，`am start --display 15 …Calculator` → 截圖：計算機畫面，1096×2560。
+2. `input -d 15 tap 119 1500`（座標由截圖換算：預覽 523×1222 → 實際 1096×2560）。
+3. 再截圖 → 計算機顯示已輸入 `7`。
+4. 同期 `Display #0` 的 top activity 仍是 `com.sonymobile.launcher/.XperiaLauncher`。
+
+**感知、行動、驗證全通，且主屏完全不受影響**——這就是原版所宣稱的「後台靜默」，
+在無 root、無 LSPosed、BL 鎖死的量產機上達成。
+
+## 7.4 量測方法上的教訓
+
+「沒有產出」與「沒有輸入」是兩件事，而我第一次只憑「沒有檔案」就當成後者。
+加一個 `frames` / `acquire_attempts` / `last_capture` 計數器進狀態檔，
+一次就把問題從「平台不支援」縮到「第 526 行那三個字」。
+**先量測，再歸因。**

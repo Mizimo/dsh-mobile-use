@@ -56,6 +56,9 @@ public final class AgentVd {
     private static final String STATUS_FILE = "/data/local/tmp/vd_status.json";
     private static final String STOP_SIGNAL = "/data/local/tmp/vd_stop";
     private static final String CAPTURE_TRIGGER = "/data/local/tmp/vd_capture";
+    private static int surfaceWidth;
+    private static int surfaceHeight;
+    private static int surfaceDpi;
     private static final String SCREENSHOT_FILE = "/data/local/tmp/vd_screenshot.png";
 
     private static final int IME_POLICY_NEVER = 2;
@@ -63,6 +66,14 @@ public final class AgentVd {
     private static Object displayManager;
     private static Object virtualDisplay;
     private static Object surface;
+
+    /** Instrumentation: how many frames the display actually delivered. */
+    private static volatile int frameCount;
+    private static volatile int acquireAttempts;
+    private static volatile int acquireErrors;
+    private static volatile String lastAcquireError = "";
+    private static volatile String lastCapture = "none";
+    private static volatile long lastStatusWrite;
 
     public static void main(String[] args) {
         String mode = args.length > 0 ? args[0] : "check";
@@ -258,6 +269,9 @@ public final class AgentVd {
         // own   — the display renders its own content (a real second desktop)
         // mirror— the display mirrors the default display, which is the cheapest
         //         way to prove whether frames reach our ImageReader at all
+        surfaceWidth = width;
+        surfaceHeight = height;
+        surfaceDpi = dpi;
         int flags = "mirror".equals(flagsWord)
                 ? FLAG_PUBLIC | FLAG_AUTO_MIRROR
                 : FLAG_PUBLIC | FLAG_OWN_CONTENT_ONLY;
@@ -463,9 +477,12 @@ public final class AgentVd {
                 System.out.println("[AgentVd] stop signal detected; releasing display");
                 break;
             }
+            acquireAttempts++;
+            maybeWriteStatus(displayId);
             try {
                 Object image = invoke(reader, "acquireLatestImage");
                 if (image != null) {
+                    frameCount++;
                     if (new File(CAPTURE_TRIGGER).exists()) {
                         // The display renders into this ImageReader, so a frame here
                         // IS the display content. screencap -d refuses a virtual
@@ -480,6 +497,8 @@ public final class AgentVd {
                     Thread.sleep(16);
                 }
             } catch (Throwable t) {
+                acquireErrors++;
+                lastAcquireError = String.valueOf(t);
                 Thread.sleep(50);
             }
         }
@@ -501,7 +520,10 @@ public final class AgentVd {
             int width = (Integer) invoke(image, "getWidth");
             int height = (Integer) invoke(image, "getHeight");
             Object planes = invoke(image, "getPlanes");
-            int planeCount = (Integer) invoke(planes, "length");
+            // Plane[] has no length() method: it is an array, so read the field
+            // through java.lang.reflect.Array. Calling invoke(..., "length") here
+            // was the reason no screenshot ever appeared.
+            int planeCount = java.lang.reflect.Array.getLength(planes);
             if (planeCount < 1) {
                 return false;
             }
@@ -543,9 +565,16 @@ public final class AgentVd {
             } finally {
                 out.close();
             }
+            lastCapture = "ok " + width + "x" + height + " -> " + SCREENSHOT_FILE;
             System.out.println("[AgentVd] captured frame " + width + "x" + height + " -> " + SCREENSHOT_FILE);
             return true;
         } catch (Throwable t) {
+            StringBuilder detail = new StringBuilder("failed: ").append(t);
+            StackTraceElement[] frames = t.getStackTrace();
+            for (int i = 0; i < frames.length && i < 4; i++) {
+                detail.append(" | ").append(frames[i]);
+            }
+            lastCapture = detail.toString();
             System.out.println("[AgentVd] capture failed: " + t);
             return false;
         }
@@ -690,11 +719,32 @@ public final class AgentVd {
         }
     }
 
+    /**
+     * Rewrite the status file at most once a second while running.
+     *
+     * The frame counters are the whole point: without them "no screenshot
+     * appeared" is indistinguishable from "the display never delivered a frame".
+     */
+    private static void maybeWriteStatus(int displayId) {
+        long now = System.currentTimeMillis();
+        if (now - lastStatusWrite < 1000) {
+            return;
+        }
+        lastStatusWrite = now;
+        writeStatus("running", displayId, surfaceWidth, surfaceHeight, surfaceDpi);
+    }
+
     private static void writeStatus(String status, int displayId, int w, int h, int dpi) {
+        System.out.flush();
         try {
             String json = "{\"status\":\"" + status + "\",\"pid\":" + currentPid()
                     + ",\"display_id\":" + displayId + ",\"width\":" + w
-                    + ",\"height\":" + h + ",\"dpi\":" + dpi + "}";
+                    + ",\"height\":" + h + ",\"dpi\":" + dpi
+                    + ",\"frames\":" + frameCount
+                    + ",\"acquire_attempts\":" + acquireAttempts
+                    + ",\"acquire_errors\":" + acquireErrors
+                    + ",\"last_acquire_error\":\"" + lastAcquireError.replace("\"", "'") + "\""
+                    + ",\"last_capture\":\"" + lastCapture.replace("\"", "'") + "\"}";
             FileOutputStream out = new FileOutputStream(STATUS_FILE);
             try {
                 out.write(json.getBytes("UTF-8"));
@@ -782,21 +832,78 @@ public final class AgentVd {
             if (arg == null) {
                 continue;
             }
-            if (!params[i].isInstance(arg)) {
+            Class<?> param = params[i];
+            // int.class.isInstance(Integer.valueOf(1)) is FALSE: primitive
+            // parameter types never accept a boxed argument. Without this mapping
+            // every overload taking an int was rejected as incompatible and the
+            // caller silently fell back to the first same-arity method, which is
+            // how Bitmap.createBitmap(Bitmap,int,int,int,int) kept resolving to a
+            // different overload.
+            if (param.isPrimitive()) {
+                if (!boxed(param).isInstance(arg)) {
+                    return false;
+                }
+            } else if (!param.isInstance(arg)) {
                 return false;
             }
         }
         return true;
     }
 
+    private static Class<?> boxed(Class<?> primitive) {
+        if (primitive == int.class) {
+            return Integer.class;
+        }
+        if (primitive == long.class) {
+            return Long.class;
+        }
+        if (primitive == boolean.class) {
+            return Boolean.class;
+        }
+        if (primitive == float.class) {
+            return Float.class;
+        }
+        if (primitive == double.class) {
+            return Double.class;
+        }
+        if (primitive == short.class) {
+            return Short.class;
+        }
+        if (primitive == byte.class) {
+            return Byte.class;
+        }
+        if (primitive == char.class) {
+            return Character.class;
+        }
+        return primitive;
+    }
+
+    /**
+     * Static counterpart of {@link #invoke}, with the same overload selection.
+     *
+     * Bitmap.createBitmap alone has five 5-argument overloads; matching on arity
+     * picked `createBitmap(int[], int, int, int, int)` for a (Bitmap,int,int,int,int)
+     * call and threw IllegalArgumentException at invoke time. Type-compatible
+     * selection is what keeps that from happening.
+     */
     private static Object invokeStatic(Class<?> owner, String name, Object... args) throws Exception {
         if (owner == null) {
             return null;
         }
+        Method fallback = null;
         for (Method m : owner.getMethods()) {
-            if (m.getName().equals(name) && m.getParameterTypes().length == args.length) {
+            if (!m.getName().equals(name) || m.getParameterTypes().length != args.length) {
+                continue;
+            }
+            if (fallback == null) {
+                fallback = m;
+            }
+            if (accepts(m.getParameterTypes(), args)) {
                 return m.invoke(null, args);
             }
+        }
+        if (fallback != null) {
+            return fallback.invoke(null, args);
         }
         throw new NoSuchMethodException(name + " on " + owner);
     }

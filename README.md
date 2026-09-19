@@ -61,43 +61,56 @@ The upstream LSPosed hooks (`canHostTasks`, `isCallerAllowedToLaunchOnDisplay`,
 
 ```
 poc/
+  vd.py            the control bus: start | stop | status | launch | tap | swipe |
+                   type | key | capture
+  java/com/agent/AgentVd.java
+                   the daemon: check | probe | create <w> <h> <dpi> [pkg] [own|mirror]
+  direct_adb.py    minimal direct-ADB client: run one command, push, --hold a session
+  build.sh         javac + d8 + push, one command per iteration
   01-probe.sh      read-only capability probe (device facts, no state change)
   probe.sh         runs the probe as one policy-compliant command per call
-  direct_adb.py    minimal direct-ADB client (pushes files, runs commands)
-  build.sh         javac + d8 + push, one command per iteration
-  java/com/agent/AgentVd.java
-                   our daemon: check | probe | create <w> <h> <dpi> [pkg] [own|mirror]
+  run_on_device.py runs a script through the DSH device-shell channel and reports
+                   which lines its policy refused
 docs/
   POC-純ADB副屏.md  full analysis: what upstream needs, what shell can do, results
 ```
 
 ## Running it
 
+### The CLI
+
+```sh
+python3 poc/vd.py start                     # create the display, print its id
+python3 poc/vd.py status                    # id, geometry, frame counters, last capture
+python3 poc/vd.py launch <pkg>/<activity>   # put an app on the display
+python3 poc/vd.py tap <x> <y>
+python3 poc/vd.py swipe <x1> <y1> <x2> <y2> [ms]
+python3 poc/vd.py key <keycode>
+python3 poc/vd.py capture out.png           # frame from the display's own surface
+python3 poc/vd.py stop                      # release the display
+```
+
+`start` waits for a clean state before creating anything, and confirms the new
+display against `dumpsys display` rather than trusting its own status file — a
+single shared status path is exactly what makes a stale daemon look alive.
+
+### The pieces
+
+`vd.py` drives; these are what it calls, and they are useful on their own:
+
+```sh
+bash poc/build.sh                     # javac + d8 + push: one command per iteration
+python3 poc/direct_adb.py 'id'        # run any single command over the paired link
+python3 poc/direct_adb.py --hold '…'  # keep a shell session (and its daemon) alive
+python3 poc/direct_adb.py --push <local> <remote>
+```
+
 The device must have wireless debugging enabled and paired; `adb-shell.py` records
 the host and port under `/root/.dsh/adbkeys/`.
 
-```sh
-# 1. build our daemon into a dex and push it
-bash poc/build.sh
+`<id>` increments every time a display is created, so read it from
+`/data/local/tmp/vd_status.json` (or `vd.py status`) rather than assuming 9 or 10.
 
-# 2. what does this device actually offer?
-python3 poc/direct_adb.py 'env CLASSPATH=/data/local/tmp/agent_vd2.dex \
-  app_process /system/bin com.agent.AgentVd check'
-
-# 3. create the display (hold the connection open so the daemon survives)
-python3 poc/direct_adb.py --hold 'env CLASSPATH=/data/local/tmp/agent_vd2.dex \
-  app_process /system/bin com.agent.AgentVd create 1096 2560 420 com.android.shell'
-
-# 4. put an app on it, and drive it
-python3 poc/direct_adb.py 'am start --display <id> -n com.google.android.calculator/com.android.calculator2.Calculator'
-python3 poc/direct_adb.py 'input -d <id> tap 500 1200'
-
-# 5. tear down
-python3 poc/direct_adb.py 'touch /data/local/tmp/vd_stop'
-```
-
-`<id>` is whatever `dumpsys display` reports; it increments every time a display
-is created, so read it from `/data/local/tmp/vd_status.json` rather than assuming.
 
 ## Scope discipline
 

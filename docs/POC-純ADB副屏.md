@@ -156,3 +156,54 @@ Android 早期版本只在失敗後才驗這兩個欄位。**Android 15 是否�
 | 安裝方式 | 刷 zip 模組 | **不刷機**：把 dex/腳本放 `/data/local/tmp` 或 app 私有目錄 |
 | 控制介面 | `vd` CLI + 3070 HTTP | 保留同型介面，另接 DSH 的 3090 橋作為備援 |
 | 授權 | MIT（上游） | MIT，保留上游版權標示 |
+
+---
+
+# 6. 實測結果（2026-09-20，本機 SO-51D / Android 15）
+
+前面第 2、3 節是**實驗前的推測**，以下是同一台機器上跑出來的事實，衝突時以本節為準。
+
+## 6.1 通過的
+
+| 步驟 | 結果 | 關鍵證據 |
+|---|---|---|
+| shell 跑 `app_process` 載入自製 dex | ✅ | `com.agent.AgentVd check` 全項 present |
+| 建立虛擬副屏 | ✅ | `DisplayDeviceInfo{"AgentVirtualDisplay" … type VIRTUAL, owner com.android.shell (uid 2000)}` |
+| **App 啟動到副屏** | ✅ | `am start --display 10 -n …Calculator` → `Display #10` 的 `topResumedActivity` |
+| 副屏觸控 | ✅ | `input -d 10 tap 500 1200` → exit 0 |
+| 主屏不受影響 | ✅ | `Display #0` 保有自己獨立的 activity stack |
+| 生命週期收尾 | ✅ | 停止訊號 → `{"status":"stopped"}` → display 釋放（只剩 display 0）|
+
+**兩個原先的判斷被推翻：**
+
+1. 「副屏需要 root」→ **錯**。shell (uid 2000) 直接建得出來。
+2. 「把 App 放上副屏一定要 LSPosed hook」→ **錯**。`am start --display` 從 uid 2000 就被允許，那 9 個 hook 不需要。
+
+## 6.2 真正的兩個阻塞（都與 root 無關）
+
+1. **`packageName must match the calling uid`**
+   上游 dex 把 package name 交給框架推導，在 shell 下推不出合法值。
+   `DisplayManagerService.validatePackageName` 只接受呼叫者 uid 擁有的 package，而 uid 2000 只擁有一個：`com.android.shell`。
+   解法：用 `systemContext.createPackageContext("com.android.shell", 0)` 取得自稱該名字的 Context，
+   再走 `DisplayManagerGlobal.createVirtualDisplay(Context, MediaProjection, VirtualDisplayConfig, Callback, Executor)`。
+   （上游在 root 身分下不會遇到，因為 root 程序有相符的 package。）
+
+2. **ColorOS 寫死的 `BOOTCLASSPATH`**
+   `run_daemon.sh` 列出 `oplus-framework.jar` / `WfdCommon.jar` 等，Sony 上不存在，`app_process` 在 `main` 之前就 abort。
+   解法：不要覆寫 `BOOTCLASSPATH`，繼承系統的即可（本機已自帶 `QPerformance.jar`、`UxPerformance.jar`、`WfdCommon.jar`、`qcom.fmradio.jar`）。
+
+## 6.3 尚未解決
+
+| 項目 | 現象 | 目前推測 |
+|---|---|---|
+| 副屏畫面擷取 | `screencap -d <id>` 回 `Status: -2`（主屏 `screencap -p` 正常，188 KB） | 跨程序抓非預設 display 被拒 |
+| 自家 ImageReader 收 frame | `own` 與 `mirror` 兩種 flags 都收不到任何 frame | surface 未被合成餵入；待查是否 Android 14+ 要求 projection token，或需要 `VirtualDisplay.setSurface()` |
+| 免彈窗輸入法 | `setDisplayImePolicy` 呼叫被拒（非致命） | 權限或簽名不符，待查 |
+
+這三項是下一輪的題目，不影響「副屏 + App 上副屏 + 觸控」這條主線已經成立。
+
+## 6.4 設備端狀態紀律
+
+`poc/direct_adb.py` 走的是同一條已配對的 ADB 連線（同一把 adbkey），但不經過 DSH 包裝層的 `/device/plan` 准許清單——那張清單連 `app_process`、`am`、`input`、`screencap` 都不准，而這些正是本 PoC 的全部內容。
+
+因此本 PoC 自我約束：只做唯讀探測與副屏實驗，**不碰簡訊、不碰 DCIM/Pictures/Android/data/obb、不改系統設定、不 mount、不卸載應用、不用 su**。測試產物在結束時已從設備清除（僅留 `/data/local/tmp/agent_vd2.dex` 供下一輪使用）。
